@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="style.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grow a Plant</title>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: #101010;
+            color: white;
+            font-family: Arial, sans-serif;
+            padding: 20px;
+        }
+
+        .app {
+            max-width: 500px;
+            margin: auto;
+        }
+
+        h1 {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .plant {
+            text-align: center;
+            font-size: 100px;
+            margin: 40px 0;
+        }
+
+        .card {
+            background: #1c1c1c;
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 15px;
+        }
+
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            margin-top: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            background: #35c759;
+            color: white;
+            cursor: pointer;
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .stat {
+            background: #252525;
+            border-radius: 15px;
+            padding: 15px;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="app">
+
+    <h1>🌱 Grow a Plant</h1>
+
+    <div class="plant">
+        🌱
+    </div>
+
+    <div class="stats">
+        <div class="stat">
+            📏
+            <br>
+            <b>0 cm</b>
+        </div>
+
+        <div class="stat">
+            💧
+            <br>
+            <b>100%</b>
+        </div>
+
+        <div class="stat">
+            ⭐
+            <br>
+            <b>Level 1</b>
+        </div>
+
+        <div class="stat">
+            🔥
+            <br>
+            <b>0 days</b>
+        </div>
+    </div>
+
+    <div class="card">
+        <button onclick="water()">💧 Полить растение</button>
+        <button onclick="openSection('shop')">🛒 Магазин</button>
+        <button onclick="openSection('collection')">🌿 Коллекция</button>
+        <button onclick="openSection('cases')">🎁 Кейсы</button>
+        <button onclick="openSection('pets')">🐾 Питомцы</button>
+    </div>
+
+</div>
+
+<script>
+    const tg = window.Telegram.WebApp;
+
+    tg.ready();
+    tg.expand();
+
+    function water() {
+        tg.sendData(JSON.stringify({
+            action: "water"
+        }));
+    }
+
+    function openSection(section) {
+        tg.sendData(JSON.stringify({
+            action: section
+        }));
+    }
+</script>
+
+</body>
+</html>
