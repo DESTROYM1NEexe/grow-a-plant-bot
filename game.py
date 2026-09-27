@@ -76,7 +76,7 @@ PLANTS = {
 
 CASES = {
     "forest": {
-        "ru": "🎁 Лесной кейс", "en": "🎁 Forest Case", "price": 400,
+        "ru": "🎁 Лесной кейс", "en": "🎁 Forest Case", "price": 99,
         "drops": [
             ("sprout", 20), ("cactus", 20), ("berry", 18),
             ("strawberry", 15), ("carrot", 12), ("tulip", 7),
@@ -84,7 +84,7 @@ CASES = {
         ],
     },
     "flower": {
-        "ru": "💎 Цветочный кейс", "en": "💎 Flower Case", "price": 800,
+        "ru": "💎 Цветочный кейс", "en": "💎 Flower Case", "price": 299,
         "drops": [
             ("cactus", 12), ("berry", 12), ("tulip", 12),
             ("daisy", 10), ("lavender", 12), ("hibiscus", 10),
@@ -93,7 +93,7 @@ CASES = {
         ],
     },
     "royal": {
-        "ru": "👑 Королевский кейс", "en": "👑 Royal Case", "price": 1500,
+        "ru": "👑 Королевский кейс", "en": "👑 Royal Case", "price": 999,
         "drops": [
             ("tulip", 8), ("daisy", 8), ("lavender", 8), ("hibiscus", 10),
             ("rose", 12), ("lily", 10), ("sunflower", 9), ("dahlia", 8),
@@ -103,7 +103,7 @@ CASES = {
         ],
     },
     "mythic": {
-        "ru": "🌌 Мифический кейс", "en": "🌌 Mythic Case", "price": 3000,
+        "ru": "🌌 Мифический кейс", "en": "🌌 Mythic Case", "price": 1199,
         "drops": [
             ("lavender", 7), ("hibiscus", 7), ("rose", 8), ("sunflower", 8),
             ("dahlia", 8), ("lotus", 8), ("moonflower", 7), ("mango", 7),
