@@ -1,39 +1,37 @@
-﻿# Grow a Plant Bot
+﻿🌱 Grow a Plant
 
-A Telegram bot where players grow a plant, collect coins, open cases, manage a shared garden, and upgrade their garden through daily actions.
+A Telegram game where you grow plants, build your garden, discover rare mutations, and compete for a better collection.
 
-## Features
-- Daily coin farming and plant growth
-- Plant collection and mutations
-- Garden upgrades and pets
-- Shared cooperative garden invites
-- Telegram payment flow support
-- SQLite persistence
+Grow a Plant is a cozy progression-based Telegram game built around plant growing, collecting, trading, and garden development.
 
-## Requirements
-- Python 3.11+
-- Telegram bot token
+✨ What You Can Do
 
-## Setup
-1. Create a `.env` file from the example:
-   ```bash
-   copy .env.example .env
-   ```
-2. Fill in your Telegram values in `.env`.
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Run the bot:
-   ```bash
-   python Bot.py
-   ```
+🌱 Grow Plants
+Start with your own garden and grow plants through regular interactions and daily progress.
 
-## Environment variables
-- `BOT_TOKEN` — your Telegram bot token
-- `SUPPORT_CONTACT` — support contact or username
-- `ADMIN_IDS` — comma-separated Telegram user IDs
-- `DB_PATH` — SQLite database path, defaults to `garden.db`
+🪴 Build Your Collection
+Discover different plants, collect rare variants, and expand your personal collection.
 
-## License
-MIT
+🧬 Discover Mutations
+Plants can develop unique mutations, making some specimens much rarer than others.
+
+💰 Earn Coins
+Collect coins through daily activities and use them to improve your garden and unlock new content.
+
+🎁 Open Cases
+Open cases to discover new plants, items, and other rewards.
+
+🏡 Upgrade Your Garden
+Develop your garden and unlock upgrades that improve your progression.
+
+🐾 Collect Pets
+Get pets that become part of your garden and add another layer of progression.
+
+🤝 Play Together
+Invite other players and create a shared cooperative garden.
+
+🔄 Trade Plants
+Exchange plants with other players and build your collection through trading.
+
+🌍 Play in Two Languages
+The bot supports both English 🇺🇸 and Russian 🇷🇺.
