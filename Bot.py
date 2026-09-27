@@ -810,5 +810,77 @@ async def main():
 # RUN
 # =========================================================
 
+async def main():
+    global bot_username
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    try:
+        me = await bot.get_me()
+        bot_username = me.username
+
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="My garden / Мой сад"),
+                BotCommand(command="collection", description="Collection / Коллекция"),
+                BotCommand(command="shop", description="Shop / Магазин"),
+                BotCommand(command="cases", description="Cases / Кейсы"),
+                BotCommand(command="menu", description="Progress / Развитие"),
+                BotCommand(command="coop", description="Shared garden / Общий сад"),
+                BotCommand(command="trades", description="Trading / Обмен"),
+                BotCommand(command="invoices", description="Invoices / Счета"),
+                BotCommand(command="language", description="Language / Язык"),
+                BotCommand(command="paysupport", description="Payment support / Поддержка"),
+                BotCommand(command="id", description="My Telegram ID"),
+            ]
+        )
+
+        await bot.delete_webhook(drop_pending_updates=False)
+
+        logging.info(
+            "🌱 Grow a Plant started successfully as @%s",
+            bot_username,
+        )
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            polling_timeout=30,
+            backoff_config=BackoffConfig(
+                min_delay=2.0,
+                max_delay=30.0,
+                factor=1.5,
+                jitter=0.2,
+            ),
+        )
+
+    except asyncio.CancelledError:
+        logging.info("Bot shutdown requested.")
+        raise
+
+    except Exception:
+        logging.exception("Bot stopped because of an unexpected error.")
+        raise
+
+    finally:
+        logging.info("Closing database and Telegram session...")
+
+        try:
+            game.close()
+        except Exception:
+            logging.exception("Failed to close database.")
+
+        try:
+            await bot.session.close()
+        except Exception:
+            logging.exception("Failed to close Telegram session.")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped manually.")
