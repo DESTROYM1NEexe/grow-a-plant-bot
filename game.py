@@ -1,11 +1,12 @@
 import hashlib
+import html
 import json
 import secrets
 import sqlite3
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
-
 
 DAILY_COINS = 10
 TRADE_FEE = 20
@@ -113,6 +114,15 @@ CASES = {
             ("palm", 2), ("giant_tree", 1),
         ],
     },
+    "legendary": {
+        "ru": "👑 Легендарный кейс", "en": "👑 Legendary Case", "price": 1499,
+        "drops": [
+            ("lotus", 15), ("moonflower", 15), ("mango", 15),
+            ("pineapple", 12), ("dragonfruit", 10), ("starfruit", 10),
+            ("glowshroom", 8), ("bamboo", 7), ("cherry", 5),
+            ("palm", 2), ("giant_tree", 1),
+        ],
+    },
 }
 
 MUTATIONS = {
@@ -204,6 +214,7 @@ def roll_mutation():
 class Game:
     def __init__(self, path, admins):
         self.admins = set(admins)
+        self.bot_username = ""
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -235,7 +246,11 @@ class Game:
             active_plant TEXT NOT NULL DEFAULT 'sprout',
             last_water TEXT,
             growth_streak INTEGER NOT NULL DEFAULT 0,
-            admin_test INTEGER NOT NULL DEFAULT 1
+            admin_test INTEGER NOT NULL DEFAULT 1,
+            ref_code TEXT UNIQUE,
+            referred_by INTEGER,
+            streak_days INTEGER NOT NULL DEFAULT 0,
+            streak_last_date TEXT
         );
 
         CREATE TABLE IF NOT EXISTS plants (
@@ -318,11 +333,38 @@ class Game:
             status TEXT NOT NULL DEFAULT 'pending',
             completed_day TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER NOT NULL REFERENCES users(id),
+            referee_id INTEGER PRIMARY KEY REFERENCES users(id),
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS referral_milestones (
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            milestone INTEGER NOT NULL,
+            reward_given TEXT NOT NULL,
+            claimed_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, milestone)
+        );
+
+        CREATE TABLE IF NOT EXISTS streak_claims (
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            claim_date TEXT NOT NULL,
+            day_number INTEGER NOT NULL,
+            reward_desc TEXT NOT NULL,
+            PRIMARY KEY (user_id, claim_date)
+        );
         """)
 
         with self.db:
             self.column("users", "growth_streak", "INTEGER NOT NULL DEFAULT 0")
             self.column("users", "admin_test", "INTEGER NOT NULL DEFAULT 1")
+            self.column("users", "ref_code", "TEXT")
+            self.column("users", "referred_by", "INTEGER")
+            self.column("users", "streak_days", "INTEGER NOT NULL DEFAULT 0")
+            self.column("users", "streak_last_date", "TEXT")
+
             self.column("plants", "mutation", "TEXT NOT NULL DEFAULT 'none'")
             self.column("orders", "kind", "TEXT NOT NULL DEFAULT 'growth'")
             self.column("orders", "duplicate_coins", "INTEGER NOT NULL DEFAULT 0")
@@ -340,6 +382,16 @@ class Game:
                 INSERT OR IGNORE INTO gf_beds (user_id, plant_id)
                 SELECT id, active_plant FROM users
             """)
+
+            # Гарантируем, что у всех существующих пользователей есть реферальный код
+            empty_codes = self.all(
+                "SELECT id FROM users WHERE ref_code IS NULL OR ref_code = ''"
+            )
+            for row in empty_codes:
+                self.db.execute(
+                    "UPDATE users SET ref_code = ? WHERE id = ?",
+                    (secrets.token_hex(4).upper(), row["id"]),
+                )
 
             for uid in self.admins:
                 self.db.execute(
@@ -360,12 +412,12 @@ class Game:
         return self.one("SELECT * FROM users WHERE id = ?", (uid,))
 
     def profile(self, uid):
-        return self.one(
-            "SELECT * FROM gf_profiles WHERE user_id = ?", (uid,)
-        )
+        return self.one("SELECT * FROM gf_profiles WHERE user_id = ?", (uid,))
 
     def text(self, uid, ru, en):
-        return ru if self.user(uid)["lang"] == "ru" else en
+        u = self.user(uid)
+        lang = u["lang"] if u else "en"
+        return ru if lang == "ru" else en
 
     def name(self, uid, pid):
         p = PLANTS[pid]
@@ -415,24 +467,51 @@ class Game:
             if r["plant_id"] in PLANTS
         ]
 
+    def get_ref_code(self, uid):
+        u = self.user(uid)
+        if not u:
+            return secrets.token_hex(4).upper()
+        code = u["ref_code"]
+        if not code:
+            code = secrets.token_hex(4).upper()
+            with self.db:
+                self.db.execute("UPDATE users SET ref_code = ? WHERE id = ?", (code, uid))
+        return code
+
     def ensure(self, tg_user):
         uid = tg_user.id
         language = "ru" if (tg_user.language_code or "").startswith("ru") else "en"
 
         with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO users (id, lang) VALUES (?, ?)",
-                (uid, language),
-            )
-            self.db.execute(
-                "INSERT OR IGNORE INTO plants (user_id, plant_id) VALUES (?, 'sprout')",
-                (uid,),
-            )
-
-            fresh = self.db.execute(
-                "INSERT OR IGNORE INTO gf_profiles (user_id) VALUES (?)",
-                (uid,),
-            ).rowcount
+            existing = self.user(uid)
+            if existing is None:
+                code = secrets.token_hex(4).upper()
+                self.db.execute(
+                    """
+                    INSERT INTO users (id, lang, coins, ref_code)
+                    VALUES (?, ?, 0, ?)
+                    """,
+                    (uid, language, code),
+                )
+                self.db.execute(
+                    "INSERT INTO plants (user_id, plant_id) VALUES (?, 'sprout')",
+                    (uid,),
+                )
+                self.db.execute(
+                    "INSERT INTO gf_profiles (user_id) VALUES (?)",
+                    (uid,),
+                )
+                self.db.execute(
+                    "INSERT INTO gf_beds (user_id, plant_id) VALUES (?, 'sprout')",
+                    (uid,),
+                )
+            else:
+                if not existing["ref_code"]:
+                    code = secrets.token_hex(4).upper()
+                    self.db.execute(
+                        "UPDATE users SET ref_code = ? WHERE id = ?",
+                        (code, uid),
+                    )
 
             current = self.user(uid)
             if current["active_plant"] not in PLANTS or not self.owns(
@@ -440,12 +519,6 @@ class Game:
             ):
                 self.db.execute(
                     "UPDATE users SET active_plant = 'sprout' WHERE id = ?",
-                    (uid,),
-                )
-
-            if fresh:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO gf_beds (user_id, plant_id) VALUES (?, 'sprout')",
                     (uid,),
                 )
 
@@ -459,6 +532,420 @@ class Game:
                 "UPDATE coop_members SET display_name = ? WHERE user_id = ?",
                 (tg_user.full_name[:64], uid),
             )
+
+    # -------------------- REFERRAL SYSTEM --------------------
+
+    def find_inviter(self, ref_arg):
+        clean = (ref_arg or "").strip()
+        if clean.startswith("ref_"):
+            clean = clean[4:]
+        if not clean:
+            return None
+
+        # Ищем по ref_code (регистронезависимо) или по числовому Telegram ID
+        inviter = self.one(
+            "SELECT * FROM users WHERE UPPER(ref_code) = UPPER(?)",
+            (clean,),
+        )
+        if not inviter and clean.isdigit():
+            inviter = self.one("SELECT * FROM users WHERE id = ?", (int(clean),))
+        return inviter
+
+    def apply_referral(self, tg_user, ref_arg):
+        """
+        Обработка перехода по ссылке /start ref_XXXXX
+        Возвращает словарь с результатом:
+        - status: self_referral | not_found | already_referred | already_player | ok
+        """
+        uid = tg_user.id
+        inviter = self.find_inviter(ref_arg)
+
+        if not inviter:
+            self.ensure(tg_user)
+            return {"status": "not_found"}
+
+        if inviter["id"] == uid:
+            self.ensure(tg_user)
+            return {"status": "self_referral", "inviter_id": uid}
+
+        with self.db:
+            existing = self.user(uid)
+            if existing:
+                if existing["referred_by"]:
+                    return {"status": "already_referred", "inviter_id": existing["referred_by"]}
+
+                prof = self.profile(uid)
+                # Если игрок уже ухаживал за садом, он не считается новым приглашённым
+                if (prof and prof["watering_days"] > 0) or existing["growth_streak"] > 0:
+                    return {"status": "already_player"}
+
+            # Создаём профиль или привязываем пригласившего
+            self.ensure(tg_user)
+
+            # Начисляем награды: приглашённому +20 🪙, пригласившему +10 🪙
+            self.db.execute(
+                "UPDATE users SET coins = coins + 20, referred_by = ? WHERE id = ?",
+                (inviter["id"], uid),
+            )
+            self.db.execute(
+                "UPDATE users SET coins = coins + 10 WHERE id = ?",
+                (inviter["id"],),
+            )
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO referrals (referrer_id, referee_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (inviter["id"], uid, int(time.time())),
+            )
+
+            # Подсчёт общего числа рефералов
+            ref_count = self.one(
+                "SELECT COUNT(*) AS n FROM referrals WHERE referrer_id = ?",
+                (inviter["id"],),
+            )["n"]
+
+            # Проверка майлстоунов (3 и 10)
+            milestones = []
+            if ref_count >= 3:
+                m3 = self.one(
+                    "SELECT 1 FROM referral_milestones WHERE user_id = ? AND milestone = 3",
+                    (inviter["id"],),
+                )
+                if not m3:
+                    reward = self.grant_case(inviter["id"], "forest")
+                    self.db.execute(
+                        """
+                        INSERT INTO referral_milestones (user_id, milestone, reward_given, claimed_at)
+                        VALUES (?, 3, ?, ?)
+                        """,
+                        (inviter["id"], reward["text_ru"], int(time.time())),
+                    )
+                    milestones.append((3, "🎁 Forest Case", reward))
+
+            if ref_count >= 10:
+                m10 = self.one(
+                    "SELECT 1 FROM referral_milestones WHERE user_id = ? AND milestone = 10",
+                    (inviter["id"],),
+                )
+                if not m10:
+                    reward = self.grant_case(inviter["id"], "legendary")
+                    self.db.execute(
+                        """
+                        INSERT INTO referral_milestones (user_id, milestone, reward_given, claimed_at)
+                        VALUES (?, 10, ?, ?)
+                        """,
+                        (inviter["id"], reward["text_ru"], int(time.time())),
+                    )
+                    milestones.append((10, "👑 Legendary Case", reward))
+
+            return {
+                "status": "ok",
+                "inviter_id": inviter["id"],
+                "ref_count": ref_count,
+                "milestones": milestones,
+            }
+
+    def referral_info(self, uid):
+        count = self.one(
+            "SELECT COUNT(*) AS n FROM referrals WHERE referrer_id = ?",
+            (uid,),
+        )["n"]
+
+        if count < 3:
+            progress_str = f"{count}/3 referrals"
+        elif count < 10:
+            progress_str = f"{count}/10 referrals"
+        else:
+            progress_str = f"{count}/10 referrals ✅"
+
+        has_m3 = bool(self.one(
+            "SELECT 1 FROM referral_milestones WHERE user_id = ? AND milestone = 3",
+            (uid,),
+        ))
+        has_m10 = bool(self.one(
+            "SELECT 1 FROM referral_milestones WHERE user_id = ? AND milestone = 10",
+            (uid,),
+        ))
+
+        return {
+            "count": count,
+            "progress_str": progress_str,
+            "has_m3": has_m3,
+            "has_m10": has_m10,
+        }
+
+    # -------------------- 7-DAY STREAK --------------------
+
+    def streak_info(self, uid):
+        u = self.user(uid)
+        d_today = today()
+        d_yesterday = (utc().date() - timedelta(days=1)).isoformat()
+        last = u["streak_last_date"]
+        streak = u["streak_days"]
+
+        if last == d_today:
+            display_day = streak if streak > 0 else 1
+            can_claim = False
+            status_ru = "✅ Награда сегодня получена"
+            status_en = "✅ Claimed today"
+        elif last == d_yesterday:
+            display_day = (streak % 7) + 1
+            can_claim = True
+            status_ru = "🎁 Доступно к получению!"
+            status_en = "🎁 Ready to claim!"
+        else:
+            display_day = 1
+            can_claim = True
+            status_ru = "🎁 Доступно к получению (День 1)"
+            status_en = "🎁 Ready to claim (Day 1)"
+
+        return {
+            "display_day": display_day,
+            "streak_days": streak,
+            "can_claim": can_claim,
+            "progress_str": f"Day {display_day}/7",
+            "status_text": self.text(uid, status_ru, status_en),
+        }
+
+    def claim_streak(self, uid):
+        u = self.user(uid)
+        d_today = today()
+        d_yesterday = (utc().date() - timedelta(days=1)).isoformat()
+        last = u["streak_last_date"]
+        streak = u["streak_days"]
+
+        if last == d_today and not self.test(uid):
+            raise self.error(
+                uid,
+                "Сегодня награда уже получена. Возвращайся завтра!",
+                "Already claimed today. Come back tomorrow!",
+            )
+
+        day_to_claim = (streak % 7) + 1 if last == d_yesterday else 1
+
+        with self.db:
+            if day_to_claim == 1:
+                self.db.execute(
+                    "UPDATE users SET coins = coins + 50 WHERE id = ?",
+                    (uid,),
+                )
+                r_ru, r_en = "+50 🪙", "+50 🪙"
+
+            elif day_to_claim == 2:
+                res = self.grant_case(uid, "forest")
+                r_ru = f"🎁 Forest Case → {res['text_ru']}"
+                r_en = f"🎁 Forest Case → {res['text_en']}"
+
+            elif day_to_claim == 3:
+                res = self.grant_random_mutation(uid)
+                r_ru = f"🧬 Мутация: {res['ru']}"
+                r_en = f"🧬 Mutation: {res['en']}"
+
+            elif day_to_claim == 4:
+                res = self.grant_pet(uid, "bee")
+                r_ru = f"🐾 Питомец: {res['ru']}"
+                r_en = f"🐾 Pet: {res['en']}"
+
+            elif day_to_claim == 5:
+                res = self.grant_rare_plant(uid)
+                r_ru = f"🌸 Редкое растение: {res['ru']}"
+                r_en = f"🌸 Rare Plant: {res['en']}"
+
+            elif day_to_claim == 6:
+                res = self.grant_random_upgrade(uid)
+                r_ru = f"⚒ Улучшение: {res['ru']}"
+                r_en = f"⚒ Upgrade: {res['en']}"
+
+            else:  # Day 7
+                res = self.grant_case(uid, "legendary")
+                r_ru = f"👑 Legendary Case → {res['text_ru']}"
+                r_en = f"👑 Legendary Case → {res['text_en']}"
+
+            text_desc = self.text(uid, r_ru, r_en)
+
+            self.db.execute(
+                """
+                UPDATE users
+                SET streak_days = ?, streak_last_date = ?
+                WHERE id = ?
+                """,
+                (day_to_claim, d_today, uid),
+            )
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO streak_claims (user_id, claim_date, day_number, reward_desc)
+                VALUES (?, ?, ?, ?)
+                """,
+                (uid, d_today, day_to_claim, text_desc),
+            )
+
+        return day_to_claim, text_desc
+
+    # -------------------- REWARD GRANT HELPERS --------------------
+
+    def grant_case(self, uid, case_id):
+        if case_id not in CASES:
+            raise ValueError(f"Unknown case: {case_id}")
+        case = CASES[case_id]
+        ticket = secrets.randbelow(100)
+        chosen_pid = case["drops"][0][0]
+        for pid, weight in case["drops"]:
+            if ticket < weight:
+                chosen_pid = pid
+                break
+            ticket -= weight
+
+        duplicate = self.owns(uid, chosen_pid)
+        if duplicate:
+            refund = compensation(chosen_pid)
+            self.db.execute(
+                "UPDATE users SET coins = coins + ? WHERE id = ?",
+                (refund, uid),
+            )
+            return {
+                "case": case_id,
+                "pid": chosen_pid,
+                "duplicate": True,
+                "coins": refund,
+                "text_ru": f"{self.name(uid, chosen_pid)} (повтор: +{refund} 🪙)",
+                "text_en": f"{self.name(uid, chosen_pid)} (duplicate: +{refund} 🪙)",
+            }
+        else:
+            self.db.execute(
+                "INSERT INTO plants (user_id, plant_id) VALUES (?, ?)",
+                (uid, chosen_pid),
+            )
+            return {
+                "case": case_id,
+                "pid": chosen_pid,
+                "duplicate": False,
+                "coins": 0,
+                "text_ru": f"{self.name(uid, chosen_pid)} (Новое растение!)",
+                "text_en": f"{self.name(uid, chosen_pid)} (New plant!)",
+            }
+
+    def grant_random_mutation(self, uid):
+        items = self.items(uid)
+        u = self.user(uid)
+        active_row = self.item(uid, u["active_plant"])
+
+        target = None
+        if active_row and active_row["mutation"] == "none":
+            target = active_row["plant_id"]
+        else:
+            unmutated = [r["plant_id"] for r in items if r["mutation"] == "none"]
+            if unmutated:
+                target = secrets.choice(unmutated)
+
+        mut_options = [("gold", 10), ("rainbow", 30), ("spark", 60)]
+        roll = secrets.randbelow(100)
+        chosen_mut = "spark"
+        for m_key, weight in mut_options:
+            if roll < weight:
+                chosen_mut = m_key
+                break
+            roll -= weight
+
+        m_data = MUTATIONS[chosen_mut]
+
+        if target:
+            self.db.execute(
+                "UPDATE plants SET mutation = ? WHERE user_id = ? AND plant_id = ?",
+                (chosen_mut, uid, target),
+            )
+            return {
+                "ru": f"{m_data[0]} {m_data[1]} → {self.name(uid, target)}",
+                "en": f"{m_data[0]} {m_data[2]} → {self.name(uid, target)}",
+            }
+
+        self.db.execute("UPDATE users SET coins = coins + 100 WHERE id = ?", (uid,))
+        return {
+            "ru": "+100 🪙 (все растения уже имеют мутации)",
+            "en": "+100 🪙 (all plants already have mutations)",
+        }
+
+    def grant_pet(self, uid, pet_id="bee"):
+        owned = self.one(
+            "SELECT 1 FROM gf_pets WHERE user_id = ? AND pet_id = ?",
+            (uid, pet_id),
+        )
+        pet = PETS[pet_id]
+        if not owned:
+            self.db.execute(
+                "INSERT INTO gf_pets (user_id, pet_id) VALUES (?, ?)",
+                (uid, pet_id),
+            )
+            p = self.profile(uid)
+            if not p["active_pet"]:
+                self.db.execute(
+                    "UPDATE gf_profiles SET active_pet = ? WHERE user_id = ?",
+                    (pet_id, uid),
+                )
+            return {
+                "ru": f"{pet[0]} {pet[1]} (новый питомец добавлен!)",
+                "en": f"{pet[0]} {pet[2]} (new pet unlocked!)",
+            }
+        else:
+            coins = pet[3]
+            self.db.execute(
+                "UPDATE users SET coins = coins + ? WHERE id = ?",
+                (coins, uid),
+            )
+            return {
+                "ru": f"{pet[0]} {pet[1]} (уже есть: +{coins} 🪙)",
+                "en": f"{pet[0]} {pet[2]} (already owned: +{coins} 🪙)",
+            }
+
+    def grant_rare_plant(self, uid):
+        candidates = [
+            pid for pid, d in PLANTS.items()
+            if d["rarity"] >= 1 and not pid.startswith("season_")
+        ]
+        unowned = [pid for pid in candidates if not self.owns(uid, pid)]
+        if unowned:
+            chosen = secrets.choice(unowned)
+            self.db.execute(
+                "INSERT INTO plants (user_id, plant_id) VALUES (?, ?)",
+                (uid, chosen),
+            )
+            return {
+                "ru": f"{self.name(uid, chosen)} (Новое редкое растение!)",
+                "en": f"{self.name(uid, chosen)} (New rare plant!)",
+            }
+
+        self.db.execute("UPDATE users SET coins = coins + 200 WHERE id = ?", (uid,))
+        return {
+            "ru": "+200 🪙 (вся коллекция редких растений собрана!)",
+            "en": "+200 🪙 (all rare plants already collected!)",
+        }
+
+    def grant_random_upgrade(self, uid):
+        p = self.profile(uid)
+        available_upgrades = []
+        for key in ("can", "fert", "beds"):
+            if p[key] < len(UPGRADES[key][2]):
+                available_upgrades.append(key)
+
+        if available_upgrades:
+            chosen = secrets.choice(available_upgrades)
+            self.db.execute(
+                f"UPDATE gf_profiles SET {chosen} = {chosen} + 1 WHERE user_id = ?",
+                (uid,),
+            )
+            upg = UPGRADES[chosen]
+            return {
+                "ru": f"{upg[0]} (+1 уровень)",
+                "en": f"{upg[1]} (+1 level)",
+            }
+
+        self.db.execute("UPDATE users SET coins = coins + 250 WHERE id = ?", (uid,))
+        return {
+            "ru": "+250 🪙 (все улучшения уже максимального уровня!)",
+            "en": "+250 🪙 (all upgrades are maxed out!)",
+        }
+
+    # -------------------- WATERING & AWARDS --------------------
 
     def error(self, uid, ru, en):
         return ValueError(self.text(uid, ru, en))
@@ -595,12 +1082,10 @@ class Game:
             )
         return amount
 
-    # -------------------- PAYMENT ORDERS --------------------
+    # -------------------- ORDERS & PAYMENTS --------------------
 
     def order(self, payload):
-        return self.one(
-            "SELECT * FROM orders WHERE payload = ?", (payload,)
-        )
+        return self.one("SELECT * FROM orders WHERE payload = ?", (payload,))
 
     def prepare(self, uid, kind, product):
         free = self.test(uid)
@@ -651,7 +1136,6 @@ class Game:
 
     def invoice_text(self, uid, order):
         pid, kind = order["plant_id"], order["kind"]
-
         if kind == "growth":
             return (
                 self.text(uid, "Рост растения +1 см", "Plant growth +1 cm"),
@@ -668,11 +1152,9 @@ class Game:
                 self.text(
                     uid,
                     f"{self.name(uid, pid)}: рост 0 см, навсегда в коллекцию. "
-                    f"Цена {order['amount']} Stars. Если при обработке оплаты "
-                    f"уже есть, получишь {order['duplicate_coins']} игровых монет.",
+                    f"Цена {order['amount']} Stars.",
                     f"{self.name(uid, pid)}: starts at 0 cm, permanent unlock. "
-                    f"Price: {order['amount']} Stars. If already owned when processed, "
-                    f"receive {order['duplicate_coins']} in-game coins.",
+                    f"Price: {order['amount']} Stars.",
                 ),
             )
 
@@ -681,12 +1163,9 @@ class Game:
             self.text(
                 uid,
                 f"Одно случайное растение за {order['amount']} Stars. "
-                "Шансы и компенсации показаны в карточке. "
-                "Награда может быть значительно дешевле кейса. "
-                "Нет обмена наград на деньги или Stars.",
+                "Шансы и компенсации показаны в карточке.",
                 f"One random plant for {order['amount']} Stars. "
-                "Odds and duplicate compensation are shown on the case card. "
-                "The reward may cost much less than the case. No cash-out.",
+                "Odds and duplicate compensation are shown on the case card.",
             ),
         )
 
@@ -721,7 +1200,6 @@ class Game:
                 ) and bool(terms.get("drops"))
 
             if valid:
-                # После разрешения оплаты отменить счёт кнопкой нельзя.
                 self.db.execute(
                     "UPDATE orders SET checked = 1 WHERE payload = ?",
                     (payload,),
@@ -729,10 +1207,6 @@ class Game:
             return valid
 
     def deliver(self, uid, payload, payment=None):
-        """
-        Выдача и запись результата выполняются в одной транзакции.
-        При повторном событии оплаты возвращается сохранённый результат.
-        """
         with self.db:
             order = self.order(payload)
             if order is None or order["user_id"] != uid:
@@ -1064,7 +1538,6 @@ class Game:
                         "A growth invoice is pending. Open Invoices.",
                     )
 
-            # Исключение откатывает оба списания.
             self.spend(sender, offer["fee"])
             self.spend(target, offer["fee"])
 
@@ -1105,15 +1578,15 @@ class Game:
             [(t("🧭 Развитие", "🧭 Progress"), "menu"), (t("👥 Общий сад", "👥 Shared garden"), "coop")],
         ]
 
-    def screen(self, uid, route="home"):
-        import html
-
+    def screen(self, uid, route="home", bot_name=None):
         t = lambda ru, en: self.text(uid, ru, en)
         u, p = self.user(uid), self.profile(uid)
         parts = route.split(":")
         action = parts[0]
         rows = []
         text = ""
+
+        current_bot = bot_name or self.bot_username or "bot"
 
         if action == "home":
             pid = u["active_plant"]
@@ -1129,13 +1602,17 @@ class Game:
                 progress = "▰" * filled + "▱" * (10 - filled)
                 progress += f"\n🎯 {next_level}"
 
+            s_info = self.streak_info(uid)
+            r_info = self.referral_info(uid)
+
             text = (
                 "🌱 <b>GREEN ROOM</b>\n\n"
                 f"<b>{self.name(uid, pid)}</b>\n"
                 f"{self.rarity(uid, pid)}\n"
                 f"{m[0]} {t(m[1], m[2])}\n\n"
                 f"📏 {height} {t('см', 'cm')}\n{progress}\n\n"
-                f"🪙 {u['coins']} · 🔥 {self.streak(uid)} {t('дн.', 'days')}"
+                f"🪙 {u['coins']} · 🔥 {self.streak(uid)} {t('дн.', 'days')}\n"
+                f"📅 <b>{s_info['progress_str']}</b> · 👥 <b>{r_info['progress_str']}</b>"
             )
 
             ids = self.beds(uid)
@@ -1154,6 +1631,10 @@ class Game:
 
             rows = [
                 [(t("💧 Полить грядки", "💧 Water beds"), "water")],
+                [
+                    (t("📅 7-Day Streak", "📅 7-Day Streak"), "streak"),
+                    (t("👥 Рефералы", "👥 Referrals"), "referrals"),
+                ],
                 [(t("🪴 Настроить грядки", "🪴 Manage beds"), "beds")],
                 [(
                     t("👑 +1 см бесплатно", "👑 +1 cm free")
@@ -1169,15 +1650,115 @@ class Game:
 
         if action == "menu":
             text = t(
-                "🧭 <b>Развитие сада</b>\n\nМонеты за полив начисляются один раз в день на весь сад.",
-                "🧭 <b>Garden progress</b>\n\nWatering coins are awarded once per day for the entire garden.",
+                "🧭 <b>Развитие сада</b>\n\nВыбирай разделы для улучшений, наград и заданий:",
+                "🧭 <b>Garden progress</b>\n\nSelect a section to improve your garden, claim rewards and tasks:",
             )
             rows = [
+                [(t("📅 7-Day Streak", "📅 7-Day Streak"), "streak"), (t("👥 Рефералы", "👥 Referrals"), "referrals")],
                 [(t("🏆 Достижения", "🏆 Achievements"), "awards"), (t("📊 Рейтинг", "📊 Ranking"), "top")],
                 [(t("⚒ Улучшения", "⚒ Upgrades"), "upgrades"), (t("🐾 Питомцы", "🐾 Pets"), "pets")],
                 [(t("🧬 Мутации", "🧬 Mutations"), "mutations"), (t("📅 События", "📅 Events"), "events")],
                 [(t("🤝 Обмен", "🤝 Trading"), "trades"), (t("🧾 Счета", "🧾 Invoices"), "invoices")],
             ]
+
+        elif action == "streak":
+            s_info = self.streak_info(uid)
+            cur_day = s_info["display_day"]
+            can_claim = s_info["can_claim"]
+
+            text = t(
+                "📅 <b>7-Day Streak</b>\n\n"
+                f"Серия: <b>{s_info['progress_str']}</b>\n"
+                f"Статус: <b>{s_info['status_text']}</b>\n\n",
+                "📅 <b>7-Day Streak</b>\n\n"
+                f"Streak: <b>{s_info['progress_str']}</b>\n"
+                f"Status: <b>{s_info['status_text']}</b>\n\n",
+            )
+
+            streak_rewards = [
+                ("1", "Day 1 → 50 🪙", "Day 1 → 50 🪙"),
+                ("2", "Day 2 → 🎁 Forest Case", "Day 2 → 🎁 Forest Case"),
+                ("3", "Day 3 → 🧬 Случайная Mutation", "Day 3 → 🧬 Random Mutation"),
+                ("4", "Day 4 → 🐝 Bee 🐝", "Day 4 → 🐝 Bee 🐝"),
+                ("5", "Day 5 → 🌸 Rare Plant", "Day 5 → 🌸 Rare Plant"),
+                ("6", "Day 6 → ⚒ Случайный Upgrade", "Day 6 → ⚒ Random Upgrade"),
+                ("7", "Day 7 → 👑 Legendary Case", "Day 7 → 👑 Legendary Case"),
+            ]
+
+            for d_idx, ru_line, en_line in streak_rewards:
+                d_num = int(d_idx)
+                if d_num < cur_day or (d_num == cur_day and not can_claim):
+                    badge = "✅"
+                elif d_num == cur_day and can_claim:
+                    badge = "👉 🎁"
+                else:
+                    badge = "🔒"
+                text += f"{badge} {t(ru_line, en_line)}\n"
+
+            text += t(
+                "\n<i>Заходи каждый день! Пропуск дня возвращает на День 1. После Дня 7 серия продолжается с начала.</i>",
+                "\n<i>Check in every day! Missing a day resets the streak to Day 1. It loops back after Day 7.</i>",
+            )
+
+            if can_claim:
+                rows.append([(
+                    t(f"🎁 Забрать: День {cur_day}", f"🎁 Claim: Day {cur_day}"),
+                    "claimstreak",
+                )])
+            else:
+                rows.append([(
+                    t("✅ Сегодня получено", "✅ Claimed today"),
+                    "noop",
+                )])
+
+        elif action == "referrals":
+            r_info = self.referral_info(uid)
+            ref_code = self.get_ref_code(uid)
+            link = f"https://t.me/{current_bot}?start=ref_{ref_code}"
+
+            m3_mark = "✅" if r_info["has_m3"] else ("🔓" if r_info["count"] >= 3 else "🔒")
+            m10_mark = "✅" if r_info["has_m10"] else ("🔓" if r_info["count"] >= 10 else "🔒")
+
+            text = t(
+                "👥 <b>Реферальная система</b>\n\n"
+                f"📊 Прогресс: <b>{r_info['progress_str']}</b>\n"
+                f"Приглашено друзей: <b>{r_info['count']}</b>\n\n"
+                "🎁 <b>Награды:</b>\n"
+                "• Приглашённый друг: <b>+20 🪙</b>\n"
+                "• Ты получаешь: <b>+10 🪙</b> за каждого\n\n"
+                "🎯 <b>Цели:</b>\n"
+                f"{m3_mark} <b>3 приглашённых</b> → 🎁 Forest Case ({min(r_info['count'], 3)}/3)\n"
+                f"{m10_mark} <b>10 приглашённых</b> → 👑 Legendary Case ({min(r_info['count'], 10)}/10)\n\n"
+                "🔗 <b>Твоя персональная ссылка:</b>\n"
+                f"<code>{link}</code>\n\n"
+                "<i>(Нажми на ссылку выше, чтобы скопировать её)</i>",
+                "👥 <b>Referral System</b>\n\n"
+                f"📊 Progress: <b>{r_info['progress_str']}</b>\n"
+                f"Invited friends: <b>{r_info['count']}</b>\n\n"
+                "🎁 <b>Rewards:</b>\n"
+                "• Invited friend gets: <b>+20 🪙</b>\n"
+                "• You receive: <b>+10 🪙</b> each\n\n"
+                "🎯 <b>Milestones:</b>\n"
+                f"{m3_mark} <b>3 friends</b> → 🎁 Forest Case ({min(r_info['count'], 3)}/3)\n"
+                f"{m10_mark} <b>10 friends</b> → 👑 Legendary Case ({min(r_info['count'], 10)}/10)\n\n"
+                "🔗 <b>Your personal invite link:</b>\n"
+                f"<code>{link}</code>\n\n"
+                "<i>(Tap the link above to copy it)</i>",
+            )
+
+            # Нативная кнопка «Поделиться ссылкой» с корректным URL-encode
+            share_text = self.text(
+                uid,
+                "🌱 Выращивай сад со мной в Green Room! Заходи по ссылке и получи +20 🪙 на старте: ",
+                "🌱 Grow a plant with me in Green Room! Use my link to claim +20 🪙 bonus: ",
+            )
+            share_url = (
+                f"https://t.me/share/url?url={urllib.parse.quote(link, safe='')}"
+                f"&text={urllib.parse.quote(share_text, safe='')}"
+            )
+
+            rows.append([(t("🚀 Поделиться ссылкой", "🚀 Share invite link"), share_url)])
+            rows.append([(t("🔄 Обновить", "🔄 Refresh"), "referrals")])
 
         elif action in ("shop", "col"):
             owned = {r["plant_id"]: r for r in self.items(uid)}
@@ -1273,18 +1854,14 @@ class Game:
             ids = self.beds(uid)
             text = t("🪴 <b>Грядки</b>", "🪴 <b>Plant beds</b>")
             text += f"\n\n{len(ids)}/{1 + p['beds']}"
-            text += t(
-                "\n\nПоливаются все выбранные растения. Смена грядок не сбрасывает дневной лимит.",
-                "\n\nAll selected plants are watered together. Changing beds does not reset the daily limit.",
-            )
             for pid in ids:
                 rows.append([(f"➖ {self.name(uid, pid)}", f"bed:{pid}")])
             rows.append([(t("➕ Выбрать растения", "➕ Choose plants"), "col:all:0")])
 
         elif action == "cases":
             text = t(
-                "🎁 <b>Кейсы</b>\n\nПеред покупкой открой карточку: там все награды, шансы и компенсации.",
-                "🎁 <b>Cases</b>\n\nOpen a case card before purchasing to see rewards, odds and duplicate compensation.",
+                "🎁 <b>Кейсы</b>\n\nОткрой кейс, чтобы испытать удачу и вырастить редкие плоды!",
+                "🎁 <b>Cases</b>\n\nOpen a case to test your luck and unlock rare plants!",
             )
             for cid, case in CASES.items():
                 rows.append([(
@@ -1301,17 +1878,6 @@ class Game:
                     + t("Повтор: ", "Duplicate: ")
                     + f"{compensation(pid)} 🪙"
                 )
-            text += t(
-                "\n\nОдно растение, рост 0 см. Повтор заменяется указанными монетами. "
-                "Росток уже есть у всех. Мутация при покупке не выдаётся.\n\n"
-                "⚠️ Награда может быть значительно дешевле кейса. Сравни магазин. "
-                "Награды нельзя обменять на деньги или Stars. "
-                "Шансы не меняются от числа покупок.",
-                "\n\nOne plant starting at 0 cm. Duplicates give the listed coins. "
-                "Everyone already owns the sprout. Purchases do not grant mutations.\n\n"
-                "⚠️ The reward may cost much less than the case. Compare shop prices. "
-                "No cash-out or exchange for Stars. Odds do not change with purchases.",
-            )
             rows.append([(
                 t("👑 Открыть бесплатно", "👑 Open for free")
                 if self.test(uid) else f"⭐ {case['price']}",
@@ -1319,16 +1885,8 @@ class Game:
             )])
 
         elif action == "upgrades":
-            text = t(
-                "⚒ <b>Улучшения</b>\n\n"
-                "Лейка: +1 базовый см за уровень.\n"
-                "Удобрение: +2 монеты в день за уровень.\n"
-                "Грядки: +1 место, максимум 3.",
-                "⚒ <b>Upgrades</b>\n\n"
-                "Can: +1 base cm per level.\n"
-                "Fertilizer: +2 daily coins per level.\n"
-                "Beds: +1 slot, maximum 3.",
-            )
+            text = t("⚒ <b>Улучшения</b>\n\nЛейка: +1 см.\nУдобрение: +2 монеты.\nГрядки: +1 место.",
+                     "⚒ <b>Upgrades</b>\n\nCan: +1 cm.\nFertilizer: +2 coins.\nBeds: +1 slot.")
             text += f"\n\n🪙 {u['coins']}"
             for key, (ru, en, prices) in UPGRADES.items():
                 level = p[key]
@@ -1343,12 +1901,8 @@ class Game:
                 r["pet_id"]
                 for r in self.all("SELECT pet_id FROM gf_pets WHERE user_id = ?", (uid,))
             }
-            text = t(
-                "🐾 <b>Питомцы</b>\n\nБонус выбранного питомца начисляется один раз в день при поливе. "
-                "Купленные питомцы сохраняются.",
-                "🐾 <b>Pets</b>\n\nThe selected pet gives its bonus once daily when watering. "
-                "Purchased pets stay in your collection.",
-            )
+            text = t("🐾 <b>Питомцы</b>\n\nБонус питомца начисляется при поливе.",
+                     "🐾 <b>Pets</b>\n\nPet bonus is applied when watering.")
             text += f"\n\n🪙 {u['coins']}"
             for key, (emoji, ru, en, price, bonus) in PETS.items():
                 mark = "✅ " if p["active_pet"] == key else ""
@@ -1372,41 +1926,22 @@ class Game:
 
         elif action == "mutations":
             text = t(
-                "🧬 <b>Мутации</b>\n\nПри поливе растения без мутации:\n"
+                "🧬 <b>Мутации</b>\n\nШансы при поливе:\n"
                 "98% — без изменений;\n"
                 "1,6% — ✨ сияющее, x2;\n"
                 "0,36% — 🌈 радужное, x3;\n"
-                "0,04% — 👑 золотое, x4.\n\n"
-                "Множитель действует на базовый рост с лейкой. "
-                "Мутация постоянна. Купленный +1 см не умножается.",
-                "🧬 <b>Mutations</b>\n\nWhen watering an unmutated plant:\n"
-                "98% — no change;\n"
+                "0,04% — 👑 золотое, x4.",
+                "🧬 <b>Mutations</b>\n\nWatering chances:\n"
+                "98% — none;\n"
                 "1.6% — ✨ sparkling, x2;\n"
                 "0.36% — 🌈 rainbow, x3;\n"
-                "0.04% — 👑 golden, x4.\n\n"
-                "The multiplier affects base growth including the can upgrade. "
-                "Mutations are permanent. Purchased +1 cm is not multiplied.",
+                "0.04% — 👑 golden, x4.",
             )
 
         elif action == "events":
             s = SEASONS[season_index()]
             w = week()
             text = f"<b>{t(s[0], s[1])}</b>\n\n{t(w[0], w[1])}"
-            text += t(
-                "\n\nВесной: +1 см каждому растению.\nОсенью: +2 монеты за полив.\n"
-                "Зимой и летом числового сезонного бонуса нет.\n\n"
-                "Событие на весь полив:\n80% — ничего;\n10% — дождь, +1 см каждому;\n"
-                "7% — +5 монет;\n3% — +10 монет.\n\n"
-                "Сезоны по месяцам UTC: зима — декабрь–февраль, весна — март–май, "
-                "лето — июнь–август, осень — сентябрь–ноябрь.\n"
-                "Сезонные покупки сохраняются навсегда.",
-                "\n\nSpring: +1 cm per plant.\nAutumn: +2 watering coins.\n"
-                "Winter and summer have no numeric season bonus.\n\n"
-                "One event per watering:\n80% — nothing;\n10% — rain, +1 cm each;\n"
-                "7% — +5 coins;\n3% — +10 coins.\n\n"
-                "UTC seasons: winter Dec–Feb, spring Mar–May, summer Jun–Aug, autumn Sep–Nov.\n"
-                "Seasonal purchases remain permanently.",
-            )
             rows.append([(self.name(uid, s[2]), f"plant:{s[2]}")])
 
         elif action == "top":
@@ -1422,20 +1957,14 @@ class Game:
                 alias = hashlib.sha256(str(result["user_id"]).encode()).hexdigest()[:6]
                 you = t(" · ты", " · you") if result["user_id"] == uid else ""
                 text += f"\n\n{index}. #{alias}{you}\n📏 {result['height']} · 🌿 {result['count']}"
-            text += t(
-                "\n\nПо суммарному росту. Платный рост учитывается. "
-                "Администраторы и отмеченные тестовые аккаунты исключены.",
-                "\n\nBy total height. Paid growth counts. "
-                "Administrators and flagged test accounts are excluded.",
-            )
 
         elif action == "coop":
             m = self.member(uid)
             text = t("👥 <b>Общий сад</b>", "👥 <b>Shared garden</b>")
             if m is None:
                 text += t(
-                    "\n\nСоздай сад и пригласи двух друзей. Каждый поливает общее дерево раз в день.",
-                    "\n\nCreate a garden and invite two friends. Each member waters the shared tree once daily.",
+                    "\n\nСоздай сад и пригласи двух друзей поливать общее дерево.",
+                    "\n\nCreate a garden and invite two friends to grow a shared tree.",
                 )
                 rows.append([(t("🌱 Создать", "🌱 Create"), "coopcreate")])
             else:
@@ -1446,10 +1975,7 @@ class Game:
                 text += f"\n\n🌳 {m['height']} · 👥 {len(members)}/3"
                 for person in members:
                     mark = "👑" if person["user_id"] == m["owner_id"] else "🌿"
-                    text += (
-                        f"\n\n{mark} {html.escape(person['display_name'])}"
-                        f"\n📏 {person['contribution']}"
-                    )
+                    text += f"\n\n{mark} {html.escape(person['display_name'])}\n📏 {person['contribution']}"
                 rows += [
                     [(t("💧 Полить · +1 см", "💧 Water · +1 cm"), "coopwater")],
                     [(t("🔄 Обновить", "🔄 Refresh"), "coop")],
@@ -1459,27 +1985,13 @@ class Game:
                 rows.append([(t("🚪 Выйти", "🚪 Leave"), "leave")])
 
         elif action == "leave":
-            text = t(
-                "🚪 Выйти из общего сада?\n\nДерево остаётся у участников. "
-                "Если ты последний, общий сад удалится. Личный сад не изменится.",
-                "🚪 Leave the shared garden?\n\nThe tree stays with other members. "
-                "If you are the last member, the shared garden is deleted. Your personal garden is unaffected.",
-            )
+            text = t("🚪 Выйти из общего сада?", "🚪 Leave the shared garden?")
             rows.append([(t("Да, выйти", "Yes, leave"), "leaveyes")])
 
         elif action == "admin":
             if uid not in self.admins:
                 raise self.error(uid, "Нет доступа.", "Access denied.")
-            text = t(
-                "👑 <b>Тестовый режим</b>\n\nВключённый режим делает покупки бесплатными "
-                "и снимает лимит полива. Прогресс сохраняется.\n\n"
-                "Тестовые аккаунты не торгуют и не участвуют в рейтинге.\n"
-                "После выключения покупки Stars становятся платными.",
-                "👑 <b>Test mode</b>\n\nEnabled mode makes purchases free "
-                "and removes watering limits. Progress is saved.\n\n"
-                "Test accounts cannot trade or enter rankings.\n"
-                "Disabling it makes Stars purchases paid.",
-            )
+            text = t("👑 <b>Тестовый режим администратора</b>", "👑 <b>Admin test mode</b>")
             text += f"\n\n{'🟢 ON' if self.test(uid) else '⚪ OFF'}"
             rows.append([(
                 t("Выключить", "Disable") if self.test(uid) else t("Включить", "Enable"),
@@ -1492,22 +2004,8 @@ class Game:
 
         elif action == "trades":
             text = t(
-                "🤝 <b>Обмен</b>\n\n"
-                "<code>/trade ID_игрока мой_plant_id его_plant_id</code>\n\n"
-                "Пример:\n<code>/trade 123456789 cactus tulip</code>\n\n"
-                "ID растения указан в карточке. Свой ID: /id.\n"
-                "Комиссия — 20 монет с каждого. До 3 сделок в день.\n"
-                "Команда подтверждает твою сторону, получатель подтверждает отдельно.\n"
-                "Рост и мутация передаются. Деньги и Stars не обмениваются.\n"
-                "Изменение растения до принятия требует нового предложения.",
-                "🤝 <b>Trading</b>\n\n"
-                "<code>/trade player_ID my_plant_id their_plant_id</code>\n\n"
-                "Example:\n<code>/trade 123456789 cactus tulip</code>\n\n"
-                "Plant IDs are on their cards. Your ID: /id.\n"
-                "Fee: 20 coins each. Up to 3 trades daily.\n"
-                "The command confirms your side; the recipient confirms separately.\n"
-                "Height and mutation transfer. No money or Stars are exchanged.\n"
-                "Changing a plant before acceptance requires a new offer.",
+                "🤝 <b>Обмен</b>\n\n<code>/trade ID_игрока твой_plant_id его_plant_id</code>",
+                "🤝 <b>Trading</b>\n\n<code>/trade player_ID your_plant_id their_plant_id</code>",
             )
             offers = self.all(
                 """
@@ -1531,31 +2029,17 @@ class Game:
             mb = MUTATIONS.get(b["mutation"], MUTATIONS["none"])
             text = (
                 t("🤝 <b>Предложение обмена</b>", "🤝 <b>Trade offer</b>")
-                + "\n\n" + t("Отправитель отдаёт:", "Sender gives:")
-                + f"\n{self.name(uid, offer['offered'])}\n📏 {a['height']} · {t(ma[1], ma[2])}"
-                + "\n\n" + t("Получатель отдаёт:", "Recipient gives:")
-                + f"\n{self.name(uid, offer['requested'])}\n📏 {b['height']} · {t(mb[1], mb[2])}"
-                + "\n\n" + t("Комиссия с каждого: ", "Fee per person: ")
-                + f"{offer['fee']} 🪙"
+                + f"\n\nОтправитель: {self.name(uid, offer['offered'])} 📏 {a['height']} · {t(ma[1], ma[2])}"
+                + f"\nПолучатель: {self.name(uid, offer['requested'])} 📏 {b['height']} · {t(mb[1], mb[2])}"
+                + f"\n\nКомиссия: {offer['fee']} 🪙"
             )
-            expires = datetime.fromtimestamp(offer["expires"], timezone.utc)
-            text += "\nUTC: " + expires.strftime("%Y-%m-%d %H:%M")
             if offer["status"] == "pending" and offer["expires"] > time.time():
                 if uid == offer["target"]:
                     rows.append([(t("✅ Принять", "✅ Accept"), f"accept:{offer['id']}")])
-                rows.append([(t("❌ Отменить / отклонить", "❌ Cancel / reject"), f"canceltrade:{offer['id']}")])
-            else:
-                text += t("\n\nПредложение закрыто.", "\n\nOffer closed.")
+                rows.append([(t("❌ Отменить", "❌ Cancel"), f"canceltrade:{offer['id']}")])
 
         elif action == "invoices":
-            text = t(
-                "🧾 <b>Счета</b>\n\nНеиспользованный счёт действует 15 минут. "
-                "Можно отменить счёт, если платёж ещё не начат. "
-                "Зависший начатый платёж: /paysupport.",
-                "🧾 <b>Invoices</b>\n\nUnused invoices expire after 15 minutes. "
-                "You can cancel before checkout starts. "
-                "For a stuck checkout: /paysupport.",
-            )
+            text = t("🧾 <b>Счета</b>", "🧾 <b>Invoices</b>")
             orders = self.all(
                 """
                 SELECT * FROM orders WHERE user_id = ? AND paid = 0
@@ -1575,7 +2059,7 @@ class Game:
                     )])
 
         else:
-            return self.screen(uid, "home")
+            return self.screen(uid, "home", bot_name=current_bot)
 
         return text, rows + self.nav(uid)
 
@@ -1609,16 +2093,23 @@ class Game:
     # -------------------- BUTTON ACTIONS --------------------
 
     def click(self, uid, data, display_name):
-        """
-        Возвращает: экран, короткое уведомление, ID для уведомления.
-        Платёжные кнопки обрабатываются в bot.py.
-        """
         parts = data.split(":")
         action = parts[0]
         route, notice, notify = data, None, None
 
         if action == "water":
             notice, route = self.water(uid), "home"
+
+        elif action == "streak":
+            route = "streak"
+
+        elif action == "referrals":
+            route = "referrals"
+
+        elif action == "claimstreak":
+            day_num, reward_text = self.claim_streak(uid)
+            notice = f"🎁 Day {day_num}: {reward_text}"
+            route = "streak"
 
         elif action == "select":
             pid = parts[1]
